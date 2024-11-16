@@ -9,13 +9,15 @@ import {
   ListRenderItem 
 } from 'react-native';
 import { Worklet } from 'react-native-bare-kit';
-import { ChatMessage, WorkletMessage } from './types';
+import { ChatMessage, WorkletMessage, Peer, P2PMessage } from './types';
 
 const App: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [peers, setPeers] = useState<Peer[]>([]);
   const [inputText, setInputText] = useState<string>('');
   const [worklet, setWorklet] = useState<Worklet | null>(null);
   const [rpc, setRpc] = useState<any>(null);
+  const [peerId, setPeerId] = useState<string>('');
 
   useEffect(() => {
     initializeChat();
@@ -29,20 +31,31 @@ const App: React.FC = () => {
     try {
       await chatWorklet.start('/app.js', `
         const rpc = new BareKit.RPC((req) => {
-          if (req.command === 'ping') {
-            console.log(req.data.toString());
-            req.reply('Hello from Bare!');
+          // Handle peer discovery
+          if (req.command === 'discover') {
+            const peerId = BareKit.getId();
+            rpc.broadcast('peer-announce', {
+              peerId,
+              name: 'User-' + peerId.substring(0, 5)
+            });
+            req.reply(peerId);
           }
-      
+
+          // Handle peer announcements
+          if (req.command === 'peer-announce') {
+            const notifyReq = rpc.request('peerDiscovered');
+            notifyReq.send(req.data);
+            req.reply('acknowledged');
+          }
+
+          // Handle messages
           if (req.command === 'message') {
             try {
               const notifyReq = rpc.request('messageReceived');
               notifyReq.send({
-                text: req.data,
-                sender: 'User',
+                ...req.data,
                 timestamp: Date.now(),
               });
-              notifyReq.reply();
               req.reply('processed');
             } catch (err) {
               console.error('Message handling error:', err);
@@ -53,42 +66,75 @@ const App: React.FC = () => {
       `);
       
       const rpcInstance = new chatWorklet.RPC((req: WorkletMessage) => {
-        console.log('RPC request received:', req.command, req.data.toString())
         if (req.command === 'messageReceived') {
           setMessages(prev => [...prev, req.data]);
           req.reply('received');
-          console.log('Message received')
+        }
+
+        if (req.command === 'peerDiscovered') {
+          setPeers(prev => {
+            const exists = prev.some(p => p.id === req.data.peerId);
+            if (!exists) {
+              return [...prev, {
+                id: req.data.peerId,
+                name: req.data.name,
+                isConnected: true
+              }];
+            }
+            return prev;
+          });
+          req.reply('acknowledged');
         }
       });
 
       setWorklet(chatWorklet);
       setRpc(rpcInstance);
+
+      // Start peer discovery
+      const req = rpcInstance.request('discover');
+      const myPeerId = await req.reply();
+      setPeerId(myPeerId);
     } catch(error) {
       console.error('Failed to initialize chat:', error);
     }
   };
 
-
   const sendMessage = async (): Promise<void> => {
     if (!inputText.trim() || !rpc) return;
-
-    try {
-      // Add message to local state immediately
-      const newMessage: ChatMessage = {
+  
+    const newMessage: ChatMessage = {
         text: inputText,
         sender: 'Me',
         timestamp: Date.now()
-      };
-      setMessages(prev => [...prev, newMessage]);
+    };
 
-      // Send to worklet
-      const req = rpc.request('message');
-      req.send(inputText);
-      console.log("Sending", inputText)
-      await req.reply().then((res: string) => console.log(res));
+    try {
+      // Add message to local state immediately
+      setMessages(prev => [...prev, newMessage]);
+  
+      // Send to worklet with timeout
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Send timeout')), 5000);
+      });
+  
+      const sendPromise = new Promise(async (resolve, reject) => {
+        try {
+          const req = rpc.request('message');
+          req.send(inputText);
+          const response = await req.reply();
+          console.log("Response:", response);
+          resolve(response);
+        } catch (err) {
+          reject(err);
+        }
+      });
+  
+      await Promise.race([timeoutPromise, sendPromise]);
       setInputText('');
     } catch(error) {
       console.error('Failed to send message:', error);
+      // Optionally remove the message from local state if send failed
+      setMessages(prev => prev.filter(msg => msg !== newMessage));
     }
   };
 
@@ -102,11 +148,27 @@ const App: React.FC = () => {
     </View>
   );
 
+  const renderPeerList = () => (
+    <View style={styles.peerList}>
+      <Text style={styles.peerHeader}>Connected Peers ({peers.length})</Text>
+      {peers.map(peer => (
+        <Text key={peer.id} style={styles.peerItem}>
+          {peer.name} ({peer.isConnected ? 'Online' : 'Offline'})
+        </Text>
+      ))}
+    </View>
+  );
+
   return (
     <View style={styles.container}>
+      {renderPeerList()}
       <FlatList
         data={messages}
-        keyExtractor={(item) => item.timestamp.toString()}
+        keyExtractor={(item) => 
+          'messageId' in item 
+            ? (item as P2PMessage).messageId 
+            : item.timestamp.toString()
+        }
         renderItem={renderMessage}
         style={styles.messageList}
       />
@@ -165,6 +227,20 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#ccc',
     borderRadius: 5,
+  },
+  peerList: {
+    padding: 10,
+    backgroundColor: '#f8f8f8',
+    borderBottomWidth: 1,
+    borderBottomColor: '#eee',
+  },
+  peerHeader: {
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  peerItem: {
+    padding: 5,
+    color: '#666',
   },
 });
 
