@@ -34,9 +34,8 @@ Ensure you have the following installed:
      ```bash
      npm run ios
      ```
-
-## Contributing
-Feel free to fork this repository and contribute by submitting pull requests. For major changes, please open an issue to discuss what you would like to change.
+## Download the app directly
+[Download the apk](https://drive.google.com/drive/folders/11NWSlzXIOhS6rU-YBFXBCiPgQQtjyuqh?usp=sharing) directly to run it on your android device or emulator.
 
 ## License
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more information.
