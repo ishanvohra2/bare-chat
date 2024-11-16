@@ -29,43 +29,48 @@ const App: React.FC = () => {
   const initializeChat = async (): Promise<void> => {
     const chatWorklet = new Worklet();
     try {
-      await chatWorklet.start('/app.js', `
-        const rpc = new BareKit.RPC((req) => {
-          // Handle peer discovery
-          if (req.command === 'discover') {
-            const peerId = BareKit.getId();
-            rpc.broadcast('peer-announce', {
-              peerId,
-              name: 'User-' + peerId.substring(0, 5)
+        await chatWorklet.start('/app.js', `
+            const rpc = new BareKit.RPC((req) => {
+              // Add logging function
+              const sendLog = (message) => {
+                const logReq = rpc.request('workletLog');
+                logReq.send(message);
+              };
+          
+              // Handle peer discovery
+              if (req.command === 'discover') {
+                sendLog('Discovering peers...');
+                const peerId = BareKit.getId();
+                rpc.broadcast('peer-announce', {
+                  peerId,
+                  name: 'User-' + peerId.substring(0, 5)
+                });
+                req.reply(peerId);
+              }
+          
+              // Handle messages
+              if (req.command === 'message') {
+                try {
+                  sendLog('Processing message: ' + JSON.stringify(req.data));
+                  const notifyReq = rpc.request('messageReceived');
+                  notifyReq.send({
+                    ...req.data,
+                    timestamp: Date.now(),
+                  });
+                  req.reply('processed');
+                } catch (err) {
+                  sendLog('Error: ' + err.message);
+                  req.reply('error');
+                }
+              }
             });
-            req.reply(peerId);
-          }
-
-          // Handle peer announcements
-          if (req.command === 'peer-announce') {
-            const notifyReq = rpc.request('peerDiscovered');
-            notifyReq.send(req.data);
-            req.reply('acknowledged');
-          }
-
-          // Handle messages
-          if (req.command === 'message') {
-            try {
-              const notifyReq = rpc.request('messageReceived');
-              notifyReq.send({
-                ...req.data,
-                timestamp: Date.now(),
-              });
-              req.reply('processed');
-            } catch (err) {
-              console.error('Message handling error:', err);
-              req.reply('error');
-            }
-          }
-        });
-      `);
+          `);
       
       const rpcInstance = new chatWorklet.RPC((req: WorkletMessage) => {
+        if (req.command === 'workletLog') {
+            console.log('Worklet Log', req.data.toString());
+            req.reply('logged');
+          }
         if (req.command === 'messageReceived') {
           setMessages(prev => [...prev, req.data]);
           req.reply('received');
@@ -122,7 +127,7 @@ const App: React.FC = () => {
           const req = rpc.request('message');
           req.send(inputText);
           const response = await req.reply();
-          console.log("Response:", response);
+          console.log("Send Message", response);
           resolve(response);
         } catch (err) {
           reject(err);
