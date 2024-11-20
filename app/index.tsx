@@ -9,6 +9,12 @@ import {
   ListRenderItem 
 } from 'react-native';
 import { Worklet } from 'react-native-bare-kit';
+import {
+  RTCPeerConnection,
+  RTCIceCandidate,
+  RTCSessionDescription,
+  mediaDevices
+} from 'react-native-webrtc';
 import { ChatMessage, WorkletMessage, Peer, P2PMessage } from './types';
 
 const App: React.FC = () => {
@@ -18,11 +24,59 @@ const App: React.FC = () => {
   const [worklet, setWorklet] = useState<Worklet | null>(null);
   const [rpc, setRpc] = useState<any>(null);
   const [peerId, setPeerId] = useState<string>('');
+  const [peerConnections, setPeerConnections] = useState<{[key: string]: RTCPeerConnection}>({});
+
+  const configuration = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ]
+  };
+
+  const createPeerConnection = (targetPeerId: string) => {
+    const peerConnection = new RTCPeerConnection(configuration);
+    
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate && rpc) {
+        const req = rpc.request('ice-candidate');
+        req.send({
+          peerId: targetPeerId,
+          candidate: event.candidate
+        });
+      }
+    };
+
+    peerConnection.onconnectionstatechange = () => {
+      setPeers(prev => prev.map(p => 
+        p.id === targetPeerId 
+          ? {...p, isConnected: peerConnection.connectionState === 'connected'}
+          : p
+      ));
+    };
+
+    peerConnection.ondatachannel = (event) => {
+      const channel = event.channel;
+      setupDataChannel(channel, targetPeerId);
+    };
+
+    setPeerConnections(prev => ({...prev, [targetPeerId]: peerConnection}));
+    return peerConnection;
+  };
+
+  const setupDataChannel = (channel: RTCDataChannel, targetPeerId: string) => {
+    channel.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      setMessages(prev => [...prev, {
+        ...message,
+        sender: peers.find(p => p.id === targetPeerId)?.name || 'Unknown'
+      }]);
+    };
+  };
 
   useEffect(() => {
     initializeChat();
     return () => {
       if (worklet) worklet.terminate();
+      Object.values(peerConnections).forEach(pc => pc.close());
     };
   }, []);
 
@@ -31,39 +85,39 @@ const App: React.FC = () => {
     try {
         await chatWorklet.start('/app.js', `
             const rpc = new BareKit.RPC((req) => {
-              // Add logging function
-              const sendLog = (message) => {
-                const logReq = rpc.request('workletLog');
-                logReq.send(message);
-              };
-          
-              // Handle peer discovery
-              if (req.command === 'discover') {
-                sendLog('Discovering peers...');
-                const peerId = BareKit.getId();
-                rpc.broadcast('peer-announce', {
-                  peerId,
-                  name: 'User-' + peerId.substring(0, 5)
-                });
-                req.reply(peerId);
-              }
-          
-              // Handle messages
-              if (req.command === 'message') {
-                try {
-                  sendLog('Processing message: ' + JSON.stringify(req.data));
-                  const notifyReq = rpc.request('messageReceived');
-                  notifyReq.send({
-                    ...req.data,
-                    timestamp: Date.now(),
-                  });
-                  req.reply('processed');
-                } catch (err) {
-                  sendLog('Error: ' + err.message);
-                  req.reply('error');
-                }
-              }
+          const sendLog = (message) => {
+            const logReq = rpc.request('workletLog');
+            logReq.send(message);
+          };
+
+          if (req.command === 'discover') {
+            sendLog('Discovering peers...');
+            const peerId = BareKit.getId();
+            rpc.broadcast('peer-announce', {
+              peerId,
+              name: 'User-' + peerId.substring(0, 5)
             });
+            req.reply(peerId);
+          }
+
+          if (req.command === 'ice-candidate') {
+            const signalingReq = rpc.request('handle-ice-candidate');
+            signalingReq.send(req.data);
+            req.reply('received');
+          }
+
+          if (req.command === 'offer') {
+            const signalingReq = rpc.request('handle-offer');
+            signalingReq.send(req.data);
+            req.reply('received');
+          }
+
+          if (req.command === 'answer') {
+            const signalingReq = rpc.request('handle-answer');
+            signalingReq.send(req.data);
+            req.reply('received');
+          }
+        });
           `);
       
       const rpcInstance = new chatWorklet.RPC((req: WorkletMessage) => {
@@ -71,25 +125,69 @@ const App: React.FC = () => {
             console.log('Worklet Log', req.data.toString());
             req.reply('logged');
           }
-        if (req.command === 'messageReceived') {
-          setMessages(prev => [...prev, req.data]);
-          req.reply('received');
-        }
-
-        if (req.command === 'peerDiscovered') {
-          setPeers(prev => {
-            const exists = prev.some(p => p.id === req.data.peerId);
-            if (!exists) {
-              return [...prev, {
-                id: req.data.peerId,
-                name: req.data.name,
-                isConnected: true
-              }];
+          if (req.command === 'handle-ice-candidate') {
+            const { peerId, candidate } = req.data;
+            const pc = peerConnections[peerId];
+            if (pc) {
+              pc.addIceCandidate(new RTCIceCandidate(candidate));
             }
-            return prev;
-          });
-          req.reply('acknowledged');
-        }
+            req.reply('processed');
+          }
+  
+          if (req.command === 'handle-offer') {
+            const { peerId, offer } = req.data;
+            const pc = createPeerConnection(peerId);
+            pc.setRemoteDescription(new RTCSessionDescription(offer))
+              .then(() => pc.createAnswer())
+              .then(answer => pc.setLocalDescription(answer))
+              .then(() => {
+                const req = rpc.request('answer');
+                req.send({
+                  peerId,
+                  answer: pc.localDescription
+                });
+              });
+            req.reply('processed');
+          }
+  
+          if (req.command === 'handle-answer') {
+            const { peerId, answer } = req.data;
+            const pc = peerConnections[peerId];
+            if (pc) {
+              pc.setRemoteDescription(new RTCSessionDescription(answer));
+            }
+            req.reply('processed');
+          }
+  
+          if (req.command === 'peerDiscovered') {
+            setPeers(prev => {
+              const exists = prev.some(p => p.id === req.data.peerId);
+              if (!exists) {
+                // Initiate WebRTC connection
+                const pc = createPeerConnection(req.data.peerId);
+                const dataChannel = pc.createDataChannel('messageChannel');
+                setupDataChannel(dataChannel, req.data.peerId);
+                
+                pc.createOffer()
+                  .then(offer => pc.setLocalDescription(offer))
+                  .then(() => {
+                    const offerReq = rpc.request('offer');
+                    offerReq.send({
+                      peerId: req.data.peerId,
+                      offer: pc.localDescription
+                    });
+                  });
+  
+                return [...prev, {
+                  id: req.data.peerId,
+                  name: req.data.name,
+                  isConnected: false
+                }];
+              }
+              return prev;
+            });
+            req.reply('acknowledged');
+          }
       });
 
       setWorklet(chatWorklet);
