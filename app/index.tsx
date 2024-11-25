@@ -1,252 +1,385 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  View, 
-  Text, 
-  TextInput, 
-  FlatList, 
-  Button, 
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
   StyleSheet,
-  ListRenderItem 
+  Alert,
+  SafeAreaView,
+  ActivityIndicator,
 } from 'react-native';
-import { Worklet } from 'react-native-bare-kit';
-import { ChatMessage, WorkletMessage, Peer, P2PMessage } from './types';
+import Clipboard from '@react-native-clipboard/clipboard';
 
-const App: React.FC = () => {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [peers, setPeers] = useState<Peer[]>([]);
-  const [inputText, setInputText] = useState<string>('');
-  const [worklet, setWorklet] = useState<Worklet | null>(null);
-  const [rpc, setRpc] = useState<any>(null);
-  const [peerId, setPeerId] = useState<string>('');
+interface Message {
+  id: string;
+  text: string;
+  sender: string;
+  peerId: string;
+  timestamp: string;
+}
 
+interface ChatState {
+  peerId: string | null;
+  messages: Message[];
+  isConnected: boolean;
+  isLoading: boolean;
+}
+
+const API_URL = 'https://bare-backend-production.up.railway.app';
+const POLLING_INTERVAL = 10000; // 10 seconds
+
+const P2PChatApp = () => {
+  const [state, setState] = useState<ChatState>({
+    peerId: null,
+    messages: [],
+    isConnected: false,
+    isLoading: false,
+  });
+  const [messageInput, setMessageInput] = useState('');
+  const [connectToPeerId, setConnectToPeerId] = useState('');
+
+  // Fetch messages from the server
+  const fetchMessages = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/api/get-messages?peerId=${state.peerId}`);
+      const data = await response.json();
+      
+      if (data.messages) {
+        setState(prev => ({
+          ...prev,
+          messages: data.messages.reverse()
+        }));
+      }
+      console.log(data)
+    } catch (error) {
+      console.error('Error fetching messages:', error);
+    }
+  }, [state.peerId]);
+
+  // Set up polling
   useEffect(() => {
-    initializeChat();
+    let pollInterval: NodeJS.Timeout;
+
+    if (state.isConnected) {
+      // Initial fetch
+      fetchMessages();
+
+      // Set up polling interval
+      pollInterval = setInterval(fetchMessages, POLLING_INTERVAL);
+    }
+
+    // Cleanup
     return () => {
-      if (worklet) worklet.terminate();
+      if (pollInterval) {
+        clearInterval(pollInterval);
+      }
     };
+  }, [state.isConnected, fetchMessages]);
+
+  // Generate a new peer ID for the user
+  const generatePeerId = useCallback(async () => {
+    try {
+      setState(prev => ({ ...prev, isLoading: true }));
+      const response = await fetch(`${API_URL}/api/get-peer-id`);
+      const data = await response.json();
+      
+      if (data.id) {
+        setState(prev => ({
+          ...prev,
+          peerId: data.id,
+          isLoading: false,
+        }));
+        Clipboard.setString(data.id);
+
+        Alert.alert('Success', `Your Peer ID: ${data.id}`);
+      }
+    } catch (error) {
+      console.error('Error generating peer ID:', error);
+      Alert.alert('Error', 'Failed to generate peer ID');
+      setState(prev => ({ ...prev, isLoading: false }));
+    }
   }, []);
 
-  const initializeChat = async (): Promise<void> => {
-    const chatWorklet = new Worklet();
-    try {
-        await chatWorklet.start('/app.js', `
-            const rpc = new BareKit.RPC((req) => {
-              // Add logging function
-              const sendLog = (message) => {
-                const logReq = rpc.request('workletLog');
-                logReq.send(message);
-              };
-          
-              // Handle peer discovery
-              if (req.command === 'discover') {
-                sendLog('Discovering peers...');
-                const peerId = BareKit.getId();
-                rpc.broadcast('peer-announce', {
-                  peerId,
-                  name: 'User-' + peerId.substring(0, 5)
-                });
-                req.reply(peerId);
-              }
-          
-              // Handle messages
-              if (req.command === 'message') {
-                try {
-                  sendLog('Processing message: ' + JSON.stringify(req.data));
-                  const notifyReq = rpc.request('messageReceived');
-                  notifyReq.send({
-                    ...req.data,
-                    timestamp: Date.now(),
-                  });
-                  req.reply('processed');
-                } catch (err) {
-                  sendLog('Error: ' + err.message);
-                  req.reply('error');
-                }
-              }
-            });
-          `);
-      
-      const rpcInstance = new chatWorklet.RPC((req: WorkletMessage) => {
-        if (req.command === 'workletLog') {
-            console.log('Worklet Log', req.data.toString());
-            req.reply('logged');
-          }
-        if (req.command === 'messageReceived') {
-          setMessages(prev => [...prev, req.data]);
-          req.reply('received');
-        }
-
-        if (req.command === 'peerDiscovered') {
-          setPeers(prev => {
-            const exists = prev.some(p => p.id === req.data.peerId);
-            if (!exists) {
-              return [...prev, {
-                id: req.data.peerId,
-                name: req.data.name,
-                isConnected: true
-              }];
-            }
-            return prev;
-          });
-          req.reply('acknowledged');
-        }
-      });
-
-      setWorklet(chatWorklet);
-      setRpc(rpcInstance);
-
-      // Start peer discovery
-      const req = rpcInstance.request('discover');
-      const myPeerId = await req.reply();
-      setPeerId(myPeerId);
-    } catch(error) {
-      console.error('Failed to initialize chat:', error);
+  // Connect to another peer
+  const connectToPeer = useCallback(async () => {
+    if (!connectToPeerId) {
+      Alert.alert('Error', 'Please enter a peer ID to connect');
+      return;
     }
-  };
-
-  const sendMessage = async (): Promise<void> => {
-    if (!inputText.trim() || !rpc) return;
-  
-    const newMessage: ChatMessage = {
-        text: inputText,
-        sender: 'Me',
-        timestamp: Date.now()
-    };
 
     try {
-      // Add message to local state immediately
-      setMessages(prev => [...prev, newMessage]);
-  
-      // Send to worklet with timeout
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Send timeout')), 5000);
-      });
-  
-      const sendPromise = new Promise(async (resolve, reject) => {
-        try {
-          const req = rpc.request('message');
-          req.send(inputText);
-          const response = await req.reply();
-          console.log("Send Message", response);
-          resolve(response);
-        } catch (err) {
-          reject(err);
-        }
-      });
-  
-      await Promise.race([timeoutPromise, sendPromise]);
-      setInputText('');
-    } catch(error) {
-      console.error('Failed to send message:', error);
-      // Optionally remove the message from local state if send failed
-      setMessages(prev => prev.filter(msg => msg !== newMessage));
-    }
-  };
+      setState(prev => ({ ...prev, isLoading: true }));
+      const response = await fetch(
+        `${API_URL}/api/connect-peers?peerId=${connectToPeerId}`
+      );
+      const data = await response.json();
 
-  const renderMessage: ListRenderItem<ChatMessage> = ({ item }) => (
-    <View style={styles.messageContainer}>
-      <Text style={styles.sender}>{item.sender}</Text>
-      <Text style={styles.messageText}>{item.text}</Text>
-      <Text style={styles.timestamp}>
+      if (data.status === 'connected') {
+        setState(prev => ({
+          ...prev,
+          isConnected: true,
+          isLoading: false,
+          messages: data.messages || []
+        }));
+        Alert.alert('Success', 'Connected to peer!');
+      }
+    } catch (error) {
+      console.error('Error connecting to peer:', error);
+      Alert.alert('Error', 'Failed to connect to peer');
+      setState(prev => ({ ...prev, isLoading: false }));
+    }
+  }, [connectToPeerId]);
+
+  // Send a message
+  const sendMessage = useCallback(async () => {
+    if (!messageInput.trim() || !state.isConnected) {
+      Alert.alert('Error', 'Please connect to a peer and enter a message');
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/api/send-message`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: messageInput,
+          sender: state.peerId,
+          peerId: state.peerId
+        })
+      });
+
+      const data = await response.json();
+
+      console.log(data)
+
+      if (data.status === 'message sent') {
+        setMessageInput('');
+        // Fetch messages immediately after sending
+        fetchMessages();
+      }
+    } catch (error) {
+      console.error('Error sending message:', error);
+      Alert.alert('Error', 'Failed to send message');
+    }
+  }, [messageInput, state.isConnected, state.peerId, fetchMessages]);
+
+  // Render message item
+  const renderMessage = ({ item }: { item: Message }) => (
+    <View style={[
+      styles.messageContainer,
+      item.sender === state.peerId ? styles.sentMessage : styles.receivedMessage
+    ]}>
+      <Text style={styles.senderText}>
+        {item.sender === state.peerId ? 'You' : `Peer (${item.sender.slice(0, 8)}...)`}
+      </Text>
+      <Text style={[
+        styles.messageText,
+        item.sender === state.peerId ? styles.sentMessageText : styles.receivedMessageText
+      ]}>
+        {item.text}
+      </Text>
+      <Text style={styles.timestampText}>
         {new Date(item.timestamp).toLocaleTimeString()}
       </Text>
     </View>
   );
 
-  const renderPeerList = () => (
-    <View style={styles.peerList}>
-      <Text style={styles.peerHeader}>Connected Peers ({peers.length})</Text>
-      {peers.map(peer => (
-        <Text key={peer.id} style={styles.peerItem}>
-          {peer.name} ({peer.isConnected ? 'Online' : 'Offline'})
-        </Text>
-      ))}
-    </View>
-  );
-
   return (
-    <View style={styles.container}>
-      {renderPeerList()}
-      <FlatList
-        data={messages}
-        keyExtractor={(item) => 
-          'messageId' in item 
-            ? (item as P2PMessage).messageId 
-            : item.timestamp.toString()
-        }
-        renderItem={renderMessage}
-        style={styles.messageList}
-      />
-      <View style={styles.inputContainer}>
-        <TextInput
-          style={styles.input}
-          value={inputText}
-          onChangeText={setInputText}
-          placeholder="Type a message..."
-          onSubmitEditing={sendMessage}
-        />
-        <Button title="Send" onPress={sendMessage} />
+    <SafeAreaView style={styles.container}>
+      {state.isLoading && (
+        <View style={styles.loadingOverlay}>
+          <ActivityIndicator size="large" color="#0000ff" />
+        </View>
+      )}
+
+      <View style={styles.header}>
+        <Text style={styles.title}>P2P Chat</Text>
+        {state.peerId && (
+          <Text style={styles.peerIdText}>Your ID: {state.peerId}</Text>
+        )}
       </View>
-    </View>
+
+      {!state.peerId ? (
+        <TouchableOpacity
+          style={styles.button}
+          onPress={generatePeerId}
+          disabled={state.isLoading}
+        >
+          <Text style={styles.buttonText}>Generate Peer ID</Text>
+        </TouchableOpacity>
+      ) : !state.isConnected ? (
+        <View style={styles.connectionContainer}>
+          <TextInput
+            style={styles.input}
+            placeholder="Enter Peer ID to connect"
+            value={connectToPeerId}
+            onChangeText={setConnectToPeerId}
+          />
+          <TouchableOpacity
+            style={styles.button}
+            onPress={connectToPeer}
+            disabled={state.isLoading}
+          >
+            <Text style={styles.buttonText}>Connect</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <View style={styles.chatContainer}>
+          <FlatList
+            data={state.messages}
+            renderItem={renderMessage}
+            keyExtractor={item => item.id}
+            style={styles.messagesList}
+            inverted
+          />
+          <View style={styles.inputContainer}>
+            <TextInput
+              style={styles.messageInput}
+              placeholder="Type a message..."
+              value={messageInput}
+              onChangeText={setMessageInput}
+              multiline
+            />
+            <TouchableOpacity
+              style={[
+                styles.sendButton,
+                !messageInput.trim() && styles.sendButtonDisabled
+              ]}
+              onPress={sendMessage}
+              disabled={!messageInput.trim()}
+            >
+              <Text style={styles.buttonText}>Send</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+    </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 10,
-    backgroundColor: '#fff',
+    backgroundColor: '#f5f5f5',
   },
-  messageList: {
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(255, 255, 255, 0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 999,
+  },
+  header: {
+    padding: 16,
+    backgroundColor: '#fff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    textAlign: 'center',
+  },
+  peerIdText: {
+    fontSize: 12,
+    color: '#666',
+    textAlign: 'center',
+    marginTop: 8,
+  },
+  connectionContainer: {
+    padding: 16,
+  },
+  input: {
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  button: {
+    backgroundColor: '#007AFF',
+    padding: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  buttonText: {
+    color: '#fff',
+    fontWeight: 'bold',
+  },
+  chatContainer: {
+    flex: 1,
+    padding: 16,
+  },
+  messagesList: {
     flex: 1,
   },
   messageContainer: {
-    padding: 10,
-    marginVertical: 5,
-    backgroundColor: '#f0f0f0',
-    borderRadius: 5,
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 8,
+    maxWidth: '80%',
   },
-  sender: {
-    fontWeight: 'bold',
-    marginBottom: 5,
+  sentMessage: {
+    backgroundColor: '#007AFF',
+    alignSelf: 'flex-end',
+  },
+  receivedMessage: {
+    backgroundColor: '#E5E5EA',
+    alignSelf: 'flex-start',
+  },
+  senderText: {
+    fontSize: 12,
+    color: '#666',
+    marginBottom: 4,
   },
   messageText: {
     fontSize: 16,
   },
-  timestamp: {
-    fontSize: 12,
+  timestampText: {
+    fontSize: 10,
     color: '#666',
-    marginTop: 5,
+    marginTop: 4,
     alignSelf: 'flex-end',
   },
   inputContainer: {
     flexDirection: 'row',
-    padding: 10,
-    borderTopWidth: 1,
-    borderTopColor: '#eee',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    padding: 8,
+    borderRadius: 8,
+    marginTop: 16,
   },
-  input: {
+  messageInput: {
     flex: 1,
-    marginRight: 10,
-    padding: 10,
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 5,
+    padding: 8,
+    maxHeight: 100,
   },
-  peerList: {
-    padding: 10,
-    backgroundColor: '#f8f8f8',
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
+  sendButton: {
+    backgroundColor: '#007AFF',
+    padding: 12,
+    borderRadius: 8,
+    marginLeft: 8,
   },
-  peerHeader: {
-    fontWeight: 'bold',
-    marginBottom: 5,
+  sentMessageText: {
+    color: '#ffffff',
   },
-  peerItem: {
-    padding: 5,
+  receivedMessageText: {
+    color: '#000000',
+  },
+  sendButtonDisabled: {
+    opacity: 0.5,
+  },
+  lastPolledText: {
+    fontSize: 10,
     color: '#666',
+    textAlign: 'center',
+    marginTop: 4,
   },
 });
 
-export default App;
+export default P2PChatApp;
